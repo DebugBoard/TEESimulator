@@ -10,7 +10,9 @@
 // other key rather than every request for that algorithm failing.
 //
 // A keybox's PEM is taken as it comes — PKCS#8 or the bare algorithm structure — and unwrapped to the
-// bare structure the TA's key material is defined as (see `key_material`).
+// bare structure the TA's key material is defined as (see `key_material`). Key and chain are both
+// parsed here, at load, so a keybox that cannot be signed with says so once instead of failing every
+// request that reaches for it.
 
 use base64::{engine::general_purpose, Engine as _};
 use kmr_common::{
@@ -19,6 +21,8 @@ use kmr_common::{
 use kmr_ta::device::{RetrieveCertSigningInfo, SigningAlgorithm, SigningKeyType};
 use kmr_wire::keymint::{self, EcCurve};
 use roxmltree::Document;
+use x509_cert::der::Decode;
+use x509_cert::Certificate as X509Certificate;
 
 /// Per-algorithm signing key material plus its certificate chain.
 #[derive(Clone)]
@@ -123,6 +127,24 @@ fn parse_algo(node: roxmltree::Node, algo: SigningAlgorithm) -> Result<Option<Al
     if chain.len() < 2 {
         return Err(format!("{name}: expected at least 2 certificates, found {}", chain.len()));
     }
+    // Every cert in the chain must be DER we can parse, checked here rather than at first use. The
+    // chain is not just carried through: kmr-ta reads the first cert's subject to issue the leaf
+    // under (`cert::extract_subject`) and patch mode parses it to re-root the real leaf, so one
+    // unparseable cert fails every request that picks this algorithm — and the whole chain is handed
+    // to the app, which verifies it. The first bytes are logged because a mis-decoded cert is exactly
+    // what this looks like: a blob that decoded cleanly but does not start with a SEQUENCE.
+    for (i, c) in chain.iter().enumerate() {
+        if let Err(e) = X509Certificate::from_der(&c.encoded_certificate) {
+            log::warn!(
+                "teesim_km: keybox {name} chain[{i}] is not a DER certificate ({e}): {} byte(s) \
+                 starting {}; ignoring the {name} key — leaves that would be signed with it fall \
+                 back to the keybox's other key",
+                c.encoded_certificate.len(),
+                hex_prefix(&c.encoded_certificate),
+            );
+            return Ok(None);
+        }
+    }
 
     let (key, format) = match key_material(algo, &key_der) {
         Ok(k) => k,
@@ -187,16 +209,33 @@ fn key_material(algo: SigningAlgorithm, der: &[u8]) -> Result<(KeyMaterial, &'st
     }
 }
 
+/// The first few bytes of a blob as hex, for a log line about something that did not parse.
+fn hex_prefix(bytes: &[u8]) -> String {
+    let shown: Vec<String> = bytes.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    format!("{}{}", shown.join(" "), if bytes.len() > 8 { " …" } else { "" })
+}
+
 /// Strip PEM armor and all whitespace, then base64-decode.
+///
+/// The armor is matched as a MARKER, not as a whole line, which is what the daemon's own keybox
+/// inspector does (`KeyboxInspector.parsePem`) and the only form that survives a keybox writing
+/// `-----BEGIN CERTIFICATE-----MIIF…` with no line break after the header. Dropping whole lines that
+/// begin with the marker eats that line's payload with it, and because PEM wraps at 64 characters —
+/// itself a multiple of 4 — what remains is still valid base64: it decodes cleanly, to the object
+/// minus its first 48 bytes. Nothing reports an error; the blob simply no longer starts with a
+/// SEQUENCE, and the failure surfaces much later as an unexplained DER tag error at signing time.
 fn decode_pem(pem: &str) -> Result<Vec<u8>, String> {
-    let mut b64 = String::with_capacity(pem.len());
-    for line in pem.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with("-----") {
-            continue;
-        }
-        b64.extend(line.chars().filter(|c| !c.is_whitespace()));
-    }
+    // `…-----BEGIN X-----<payload>-----END X-----…` splits into ["…", "BEGIN X", "<payload>",
+    // "END X", "…"], so the payload is the piece just past the BEGIN marker, wherever the marker
+    // sits on its line. Text carrying no armor at all is taken as bare base64, as it always was.
+    let body = if pem.contains("-----BEGIN") {
+        let mut parts = pem.split("-----");
+        let begin = parts.position(|p| p.starts_with("BEGIN"));
+        begin.and_then(|_| parts.next()).unwrap_or("")
+    } else {
+        pem
+    };
+    let b64: String = body.chars().filter(|c| !c.is_whitespace()).collect();
     general_purpose::STANDARD.decode(&b64).map_err(|e| format!("base64: {e:?}"))
 }
 
