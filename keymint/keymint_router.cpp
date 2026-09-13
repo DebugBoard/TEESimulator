@@ -12,6 +12,8 @@
 #include <aidl/android/hardware/security/keymint/BnKeyMintOperation.h>
 #include <android/binder_ibinder.h>  // AIBinder_getCallingUid
 
+#include <chrono>
+#include <condition_variable>
 #include <ctime>
 #include <cstdlib>
 #include <cstring>
@@ -78,6 +80,9 @@ struct Profile {
 // Live routing, swapped atomically by teesim_cfg_commit under g_cfg_mu.
 std::mutex g_cfg_mu;
 std::vector<Profile> g_profiles;
+// Signalled by teesim_cfg_commit. Operations on one of our own key blobs wait on this rather than
+// failing while the daemon has not pushed a config yet; see WaitForDefaultTa.
+std::condition_variable g_cfg_cv;
 bool g_strongbox_ok = false;  // device can patch real StrongBox keys; else StrongBox forces generation
 // The device-wide MODULE_HASH to seed a freshly built TA with, so a generation-mode key carries the
 // tag keystore2 only sends once per boot (and never resends to a TA built afterwards). Preference:
@@ -186,13 +191,48 @@ RequestTarget ProfileForRequest(const std::vector<KeyParameter>& params, uid_t c
   return {};
 }
 
+// How long an operation on one of our own key blobs waits for the daemon's first config push.
+constexpr auto kConfigWait = std::chrono::seconds(8);
+
+// ErrorCode::HARDWARE_NOT_YET_AVAILABLE. Returned when a key of ours outlives the wait below: it says
+// "come back later", where the UNIMPLEMENTED we used to return says "this key is unusable" and pushes
+// the app into deleting and regenerating it.
+constexpr int32_t kNotYetAvailable = -85;
+
 // The TA used for operations on an existing blob of ours (begin/upgrade/etc.), at the level the op
 // arrived on. Any profile's TA can decrypt any of our blobs (the KEK is level- and profile-
 // independent), but the level must match so the reference TA finds the key's characteristics at its
 // own level; the front profile's instance for `level` serves as that default.
-TaPtr DefaultTaFor(SecurityLevel level) {
-  std::lock_guard<std::mutex> lk(g_cfg_mu);
-  if (g_profiles.empty()) return {};
+//
+// It waits out the window between this library taking over keystore2's KeyMint and the daemon
+// pushing the config that builds those TAs. keystore2 resolves KeyMint — and apps start using their
+// keys — within a second of boot, while the daemon still has to harvest and validate before it can
+// push. A key of OURS touched in that window has no TA to serve it, and the hard error we used to
+// return reads to keystore2 (and to the app) as "this key is broken": the app's recovery is to delete
+// the alias and generate a fresh key, which silently destroys everything the old key had encrypted.
+// Blocking the caller for a moment instead costs a stall at boot and keeps the key.
+TaPtr WaitForDefaultTa(SecurityLevel level) {
+  // Latched once the wait has run out, so a daemon that never pushes (no keybox, say) costs one
+  // stall rather than one per call: every app touching a key of ours would otherwise park a
+  // keystore2 binder thread for the full timeout and could starve the pool at boot.
+  static bool gave_up = false;
+  std::unique_lock<std::mutex> lk(g_cfg_mu);
+  if (g_profiles.empty()) {
+    if (gave_up) return {};
+    LOGW("no profile configured yet; holding an operation on one of our keys for up to %llds "
+         "rather than failing it",
+         static_cast<long long>(kConfigWait.count()));
+    g_cfg_cv.wait_for(lk, kConfigWait, [] { return !g_profiles.empty(); });
+    if (g_profiles.empty()) {
+      gave_up = true;
+      LOGE("still no profile after waiting; the daemon never pushed a config (missing or invalid "
+           "keybox?). Reporting the hardware as not yet available — an app that gives up here may "
+           "regenerate its key and lose whatever it had encrypted");
+      return {};
+    }
+    LOGI("config arrived while waiting; serving the operation");
+  }
+  gave_up = false;
   return g_profiles.front().TaFor(level);
 }
 
@@ -427,12 +467,70 @@ const TsTimestampToken* FlattenTimestamp(const std::optional<secureclock::TimeSt
   return storage;
 }
 
+// --- Operation tracing -------------------------------------------------------
+//
+// A capture that records only blob_len cannot answer the question these failures
+// pose: whether a decrypt that fails its tag is being asked to decrypt ciphertext
+// that belongs to a different key, or whether the operation itself was mishandled.
+// Length is not identity -- two keys of the same size are indistinguishable, and a
+// blob that changed under an upgrade keeps its length. So tag every blob, and
+// record what an AEAD verdict actually depends on: the nonce, the tag length, and
+// the byte counts on the way through.
+
+// 64-bit FNV-1a over the blob, printed as 16 hex digits. A digest, not the bytes:
+// enough to say "the same blob as before" or "a different one", and no key material
+// reaches the log.
+std::string BlobTag(const std::vector<uint8_t>& blob) {
+  uint64_t h = 0xcbf29ce484222325ULL;
+  for (uint8_t b : blob) {
+    h ^= b;
+    h *= 0x100000001b3ULL;
+  }
+  char buf[17];
+  snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(h));
+  return std::string(buf);
+}
+
+std::string HexOf(const std::vector<uint8_t>& v) {
+  static const char* kHex = "0123456789abcdef";
+  std::string out;
+  out.reserve(v.size() * 2);
+  for (uint8_t b : v) {
+    out.push_back(kHex[b >> 4]);
+    out.push_back(kHex[b & 0xf]);
+  }
+  return out;
+}
+
+// The begin parameters an AEAD or RSA verdict turns on. A wrong nonce and stale
+// ciphertext both surface as VERIFICATION_FAILED, and nothing in the old capture
+// told them apart.
+std::string OpParams(const std::vector<KeyParameter>& params) {
+  std::string out;
+  for (const auto& p : params) {
+    if (p.tag == Tag::NONCE && p.value.getTag() == KeyParameterValue::blob) {
+      out += " nonce=" + HexOf(p.value.get<KeyParameterValue::blob>());
+    } else if (p.tag == Tag::MAC_LENGTH && p.value.getTag() == KeyParameterValue::integer) {
+      out += " mac_len=" + std::to_string(p.value.get<KeyParameterValue::integer>());
+    } else if (p.tag == Tag::BLOCK_MODE && p.value.getTag() == KeyParameterValue::blockMode) {
+      out += " block_mode=" +
+             std::to_string(static_cast<int>(p.value.get<KeyParameterValue::blockMode>()));
+    } else if (p.tag == Tag::PADDING && p.value.getTag() == KeyParameterValue::paddingMode) {
+      out += " padding=" +
+             std::to_string(static_cast<int>(p.value.get<KeyParameterValue::paddingMode>()));
+    } else if (p.tag == Tag::DIGEST && p.value.getTag() == KeyParameterValue::digest) {
+      out += " digest=" + std::to_string(static_cast<int>(p.value.get<KeyParameterValue::digest>()));
+    }
+  }
+  return out;
+}
+
 // --- IKeyMintOperation -------------------------------------------------------
 
 class TeesimKeyMintOperation : public BnKeyMintOperation {
  public:
-  TeesimKeyMintOperation(TaPtr ta, int64_t op_handle)
-      : ta_(std::move(ta)), op_handle_(op_handle) {}
+  TeesimKeyMintOperation(TaPtr ta, int64_t op_handle, std::string blob_tag)
+      : ta_(std::move(ta)), op_handle_(op_handle), blob_tag_(std::move(blob_tag)) {}
   ~TeesimKeyMintOperation() override {
     if (!finished_) teesim_km_abort(ta_.get(), op_handle_);
   }
@@ -442,8 +540,10 @@ class TeesimKeyMintOperation : public BnKeyMintOperation {
                                const std::optional<secureclock::TimeStampToken>& tst) override {
     TsAuthToken at;
     TsTimestampToken tt;
-    return Status(teesim_km_update_aad(ta_.get(), op_handle_, input.data(), input.size(),
-                                       FlattenAuth(authToken, &at), FlattenTimestamp(tst, &tt)));
+    int32_t rc = teesim_km_update_aad(ta_.get(), op_handle_, input.data(), input.size(),
+                                      FlattenAuth(authToken, &at), FlattenTimestamp(tst, &tt));
+    LOGI("op[%s] ours update_aad: aad=%zu rc=%d", blob_tag_.c_str(), input.size(), rc);
+    return Status(rc);
   }
 
   ndk::ScopedAStatus update(const std::vector<uint8_t>& input,
@@ -456,6 +556,9 @@ class TeesimKeyMintOperation : public BnKeyMintOperation {
     size_t len = 0;
     int32_t rc = teesim_km_update(ta_.get(), op_handle_, input.data(), input.size(),
                                   FlattenAuth(authToken, &at), FlattenTimestamp(tst, &tt), &buf, &len);
+    in_total_ += input.size();
+    LOGI("op[%s] ours update: in=%zu out=%zu in_total=%zu rc=%d", blob_tag_.c_str(), input.size(),
+         len, in_total_, rc);
     if (rc != 0) return Status(rc);
     out->assign(buf, buf + len);
     teesim_km_free_buf(buf, len);
@@ -482,6 +585,11 @@ class TeesimKeyMintOperation : public BnKeyMintOperation {
                                   FlattenAuth(authToken, &at), FlattenTimestamp(tst, &tt), conf_ptr,
                                   conf_len, &buf, &len);
     finished_ = true;
+    // in_total is what the tag check actually consumed: for GCM the reference TA
+    // holds the trailing tag back from update() and verifies it here, so a finish
+    // with no input is normal and the interesting number is everything before it.
+    LOGI("op[%s] ours finish: in=%zu sig=%zu in_total=%zu out=%zu rc=%d", blob_tag_.c_str(), in_len,
+         sig_len, in_total_ + in_len, len, rc);
     if (rc != 0) return Status(rc);
     out->assign(buf, buf + len);
     teesim_km_free_buf(buf, len);
@@ -496,7 +604,69 @@ class TeesimKeyMintOperation : public BnKeyMintOperation {
  private:
   TaPtr ta_;
   int64_t op_handle_;
+  std::string blob_tag_;
+  size_t in_total_ = 0;
   bool finished_ = false;
+};
+
+// --- IKeyMintOperation, forwarded --------------------------------------------
+//
+// A forwarded begin used to hand keystore2 the real HAL's operation object, after
+// which update/finish went straight there and nothing about them was observable
+// here. That is precisely the case that needs watching -- a non-target app whose
+// decrypt fails its tag in the real TA -- so wrap the operation and delegate. Every
+// call is passed through untouched; only the counts are recorded.
+class ForwardedKeyMintOperation : public BnKeyMintOperation {
+ public:
+  ForwardedKeyMintOperation(std::shared_ptr<IKeyMintOperation> real, std::string blob_tag)
+      : real_(std::move(real)), blob_tag_(std::move(blob_tag)) {}
+
+  ndk::ScopedAStatus updateAad(const std::vector<uint8_t>& input,
+                               const std::optional<HardwareAuthToken>& authToken,
+                               const std::optional<secureclock::TimeStampToken>& tst) override {
+    ForwardGuard g;
+    auto st = real_->updateAad(input, authToken, tst);
+    LOGI("op[%s] real update_aad: aad=%zu ok=%d", blob_tag_.c_str(), input.size(), st.isOk());
+    return st;
+  }
+
+  ndk::ScopedAStatus update(const std::vector<uint8_t>& input,
+                            const std::optional<HardwareAuthToken>& authToken,
+                            const std::optional<secureclock::TimeStampToken>& tst,
+                            std::vector<uint8_t>* out) override {
+    ForwardGuard g;
+    auto st = real_->update(input, authToken, tst, out);
+    in_total_ += input.size();
+    LOGI("op[%s] real update: in=%zu out=%zu in_total=%zu ok=%d", blob_tag_.c_str(), input.size(),
+         out ? out->size() : 0, in_total_, st.isOk());
+    return st;
+  }
+
+  ndk::ScopedAStatus finish(const std::optional<std::vector<uint8_t>>& input,
+                            const std::optional<std::vector<uint8_t>>& signature,
+                            const std::optional<HardwareAuthToken>& authToken,
+                            const std::optional<secureclock::TimeStampToken>& tst,
+                            const std::optional<std::vector<uint8_t>>& confirmationToken,
+                            std::vector<uint8_t>* out) override {
+    ForwardGuard g;
+    auto st = real_->finish(input, signature, authToken, tst, confirmationToken, out);
+    const size_t in_len = input ? input->size() : 0;
+    LOGI("op[%s] real finish: in=%zu sig=%zu in_total=%zu out=%zu ok=%d status=%d",
+         blob_tag_.c_str(), in_len, signature ? signature->size() : 0, in_total_ + in_len,
+         out ? out->size() : 0, st.isOk(), st.getServiceSpecificError());
+    return st;
+  }
+
+  ndk::ScopedAStatus abort() override {
+    ForwardGuard g;
+    LOGI("op[%s] real abort", blob_tag_.c_str());
+    return real_->abort();
+  }
+
+ private:
+  std::shared_ptr<IKeyMintOperation> real_;
+  std::string blob_tag_;
+  size_t in_total_ = 0;
 };
 
 // --- IKeyMintDevice ----------------------------------------------------------
@@ -634,17 +804,24 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
                            const std::vector<KeyParameter>& params,
                            const std::optional<HardwareAuthToken>& authToken,
                            BeginResult* out) override {
-    LOGI("begin: purpose=%d, blob_len=%zu, ours=%d", static_cast<int>(purpose), keyBlob.size(),
-         IsOurs(keyBlob));
+    const std::string blob_tag = BlobTag(keyBlob);
+    LOGI("begin: purpose=%d, blob=%s, blob_len=%zu, ours=%d, caller_uid=%d,%s",
+         static_cast<int>(purpose), blob_tag.c_str(), keyBlob.size(), IsOurs(keyBlob),
+         AIBinder_getCallingUid(), OpParams(params).c_str());
     if (!IsOurs(keyBlob)) {
       if (real_) {
         ForwardGuard g;
-        return real_->begin(purpose, keyBlob, params, authToken, out);
+        auto st = real_->begin(purpose, keyBlob, params, authToken, out);
+        if (st.isOk() && out->operation) {
+          out->operation =
+              ndk::SharedRefBase::make<ForwardedKeyMintOperation>(out->operation, blob_tag);
+        }
+        return st;
       }
       return Status(-100);
     }
-    TaPtr ta = DefaultTaFor(level_);
-    if (!ta) return Status(-100);
+    TaPtr ta = WaitForDefaultTa(level_);
+    if (!ta) return Status(kNotYetAvailable);
     auto km = ToKmVec(params);
     TsAuthToken at;
     TsBeginResult* res = nullptr;
@@ -662,12 +839,13 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     }
     int64_t op_handle = teesim_km_begin_op_handle(res);
     teesim_km_free_begin(res);
-    out->operation = ndk::SharedRefBase::make<TeesimKeyMintOperation>(ta, op_handle);
+    out->operation = ndk::SharedRefBase::make<TeesimKeyMintOperation>(ta, op_handle, blob_tag);
     return ndk::ScopedAStatus::ok();
   }
 
   ndk::ScopedAStatus deleteKey(const std::vector<uint8_t>& keyBlob) override {
-    LOGI("deleteKey: blob_len=%zu, ours=%d", keyBlob.size(), IsOurs(keyBlob));
+    LOGI("deleteKey: blob=%s, blob_len=%zu, ours=%d, caller_uid=%d", BlobTag(keyBlob).c_str(),
+         keyBlob.size(), IsOurs(keyBlob), AIBinder_getCallingUid());
     if (!IsOurs(keyBlob)) {
       if (real_) {
         ForwardGuard g;
@@ -675,24 +853,32 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
       }
       return ndk::ScopedAStatus::ok();
     }
-    TaPtr ta = DefaultTaFor(level_);
-    if (!ta) return ndk::ScopedAStatus::ok();
+    TaPtr ta = WaitForDefaultTa(level_);
+    if (!ta) return Status(kNotYetAvailable);
     return Status(teesim_km_delete_key(ta.get(), keyBlob.data(), keyBlob.size()));
   }
 
   ndk::ScopedAStatus upgradeKey(const std::vector<uint8_t>& keyBlobToUpgrade,
                                 const std::vector<KeyParameter>& upgradeParams,
                                 std::vector<uint8_t>* out) override {
-    LOGI("upgradeKey: blob_len=%zu, ours=%d", keyBlobToUpgrade.size(), IsOurs(keyBlobToUpgrade));
+    // An upgrade is the one operation that legitimately replaces a blob, so it is
+    // the one place a key can quietly stop being the key that encrypted an app's
+    // data. Log what went in and what came back out.
+    LOGI("upgradeKey: blob=%s, blob_len=%zu, ours=%d, caller_uid=%d",
+         BlobTag(keyBlobToUpgrade).c_str(), keyBlobToUpgrade.size(), IsOurs(keyBlobToUpgrade),
+         AIBinder_getCallingUid());
     if (!IsOurs(keyBlobToUpgrade)) {
       if (real_) {
         ForwardGuard g;
-        return real_->upgradeKey(keyBlobToUpgrade, upgradeParams, out);
+        auto st = real_->upgradeKey(keyBlobToUpgrade, upgradeParams, out);
+        LOGI("upgradeKey: real HAL returned blob=%s, blob_len=%zu, ok=%d",
+             out ? BlobTag(*out).c_str() : "-", out ? out->size() : 0, st.isOk());
+        return st;
       }
       return Status(-100);
     }
-    TaPtr ta = DefaultTaFor(level_);
-    if (!ta) return Status(-100);
+    TaPtr ta = WaitForDefaultTa(level_);
+    if (!ta) return Status(kNotYetAvailable);
     auto km = ToKmVec(upgradeParams);
     uint8_t* buf = nullptr;
     size_t len = 0;
@@ -700,6 +886,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
                                        km.data(), km.size(), &buf, &len);
     if (rc != 0) return Status(rc);
     out->assign(buf, buf + len);
+    LOGI("upgradeKey: TA returned blob=%s, blob_len=%zu", BlobTag(*out).c_str(), out->size());
     teesim_km_free_buf(buf, len);
     return ndk::ScopedAStatus::ok();
   }
@@ -716,8 +903,8 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
       }
       return Status(-100);
     }
-    TaPtr ta = DefaultTaFor(level_);
-    if (!ta) return Status(-100);
+    TaPtr ta = WaitForDefaultTa(level_);
+    if (!ta) return Status(kNotYetAvailable);
     TsCharacteristics* res = nullptr;
     int32_t rc = teesim_km_get_key_characteristics(ta.get(), keyBlob.data(), keyBlob.size(),
                                                    appId.data(), appId.size(), appData.data(),
@@ -857,7 +1044,7 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
   // Patch mode: the real hardware generates and attests the key; we keep its genuine, hardware-backed
   // key blob and re-sign only the attestation chain under the keybox, with the root of trust patched
   // to locked/Verified. The kept blob is unmarked, so later operations on the key forward to the real
-  // HAL. Falls back to generation if the real HAL declines or returns no attestation to re-sign.
+  // HAL. Falls back to generation only if the real HAL declines outright or the re-signing fails.
   ndk::ScopedAStatus PatchAttest(::Ta* ta, const std::vector<KeyParameter>& keyParams,
                                  KeyCreationResult* out) {
     KeyCreationResult real;
@@ -873,8 +1060,15 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
       }
     }
     if (real.certificateChain.empty()) {
-      LOGW("patch: real attestation returned no certificates; generating instead");
-      return Simulate(ta, keyParams, std::nullopt, out);
+      // A symmetric key (AES/HMAC/3DES) never has a certificate, so an empty chain is the real HAL
+      // saying there is nothing to attest — not a failure. Keep the hardware key exactly as it came
+      // back: minting our own would move the app's key material into the software TA for no gain in
+      // attestation, and an auth-bound key would then be checked against a TA that holds no device
+      // HMAC key ("no device HMAC key; accepting auth_token on presence"), which is how fingerprint-
+      // bound keys start failing with KEY_USER_NOT_AUTHENTICATED.
+      LOGI("patch: real HAL returned no certificates (nothing to attest); keeping the real key");
+      *out = std::move(real);
+      return ndk::ScopedAStatus::ok();
     }
     LOGI("patch: real HAL returned %zu cert(s); re-signing only the leaf under the keybox",
          real.certificateChain.size());
@@ -1032,11 +1226,17 @@ extern "C" bool teesim_cfg_add_profile(const TsProfile* p) {
 }
 
 extern "C" int teesim_cfg_commit(uint64_t /*epoch*/, char* /*err*/, size_t /*err_len*/) {
-  std::lock_guard<std::mutex> lk(g_cfg_mu);
-  g_profiles = std::move(g_staging);
-  g_staging.clear();
-  g_strongbox_ok = g_stage_strongbox_ok;
-  return static_cast<int>(g_profiles.size());
+  int n = 0;
+  {
+    std::lock_guard<std::mutex> lk(g_cfg_mu);
+    g_profiles = std::move(g_staging);
+    g_staging.clear();
+    g_strongbox_ok = g_stage_strongbox_ok;
+    n = static_cast<int>(g_profiles.size());
+  }
+  // Release anything parked in WaitForDefaultTa now that there is a TA to serve it.
+  g_cfg_cv.notify_all();
+  return n;
 }
 
 // True if `uid` belongs to a live target profile. The transact hook uses this to scope the RKP
